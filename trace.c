@@ -73,6 +73,7 @@ struct app_config {
 	const char    *ifname;
 	const char    *bpf_obj;
 	const char    *output;
+	const char    *ignore_from;
 	uint32_t       queue_id;
 	uint32_t       count;
 	uint32_t       interval_usec;
@@ -132,6 +133,7 @@ static void usage(const char *prog)
 		"  --ttl N                  IP TTL, default: 64\n"
 		"  --reply-timeout-ms N     Wait after last send (ms), default: 3000\n"
 		"  --output PATH            reply bitmap file, default: %s\n"
+		"  --ignore-binary-from PATH  skip IPs already set in this ipdb file\n"
 		"  --bpf-obj PATH           eBPF object file, default: %s\n"
 		"  --copy                   Force XDP copy mode\n"
 		"  --zerocopy               Force XDP zero-copy mode\n"
@@ -215,6 +217,8 @@ static void parse_args(int argc, char **argv, struct app_config *cfg)
 			cfg->reply_timeout_ms = (uint32_t)parse_ulong(argv[++i], "reply-timeout-ms");
 		} else if (!strcmp(argv[i], "--output") && i + 1 < argc) {
 			cfg->output = argv[++i];
+		} else if (!strcmp(argv[i], "--ignore-binary-from") && i + 1 < argc) {
+			cfg->ignore_from = argv[++i];
 		} else if (!strcmp(argv[i], "--bpf-obj") && i + 1 < argc) {
 			cfg->bpf_obj = argv[++i];
 		} else if (!strcmp(argv[i], "--src-ip") && i + 1 < argc) {
@@ -610,9 +614,19 @@ int main(int argc, char **argv)
 		return 1;
 	fprintf(stderr, "reply bitmap: %s\n", cfg.output);
 
+	/* ① Open ignore bitmap (optional) */
+	if (cfg.ignore_from) {
+		if (ipdb_ignore_open(cfg.ignore_from) != 0) {
+			ipdb_close();
+			return 1;
+		}
+		fprintf(stderr, "ignore bitmap: %s\n", cfg.ignore_from);
+	}
+
 	/* ② Load XDP program — intercepts and drops incoming ICMP replies */
 	int map_fd;
 	if (xdp_load(cfg.bpf_obj, ifindex, &map_fd) != 0) {
+		ipdb_ignore_close();
 		ipdb_close();
 		return 1;
 	}
@@ -623,11 +637,13 @@ int main(int argc, char **argv)
 
 	/* ② Start reader thread — polls BPF map and prints new responders */
 	pthread_t reader_tid;
+	bool      reader_started = false;
 	if (pthread_create(&reader_tid, NULL, reader_thread_fn, &map_fd) != 0) {
 		perror("pthread_create");
 		xdp_unload();
 		return 1;
 	}
+	reader_started = true;
 
 	/* ③ Open AF_XDP socket for TX */
 	struct xsk_socket xsk;
@@ -649,16 +665,33 @@ int main(int argc, char **argv)
 	char first_s[INET_ADDRSTRLEN], last_s[INET_ADDRSTRLEN];
 	inet_ntop(AF_INET, &first_a, first_s, sizeof(first_s));
 	inet_ntop(AF_INET, &last_a,  last_s,  sizeof(last_s));
-	fprintf(stderr, "sending %llu ICMP Echo frame(s) on %s queue %u: %s -> %s",
-		(unsigned long long)total_frames, cfg.ifname, cfg.queue_id, src, first_s);
-	if (cfg.dst_start != cfg.dst_end)
-		fprintf(stderr, "-%s", last_s);
-	fprintf(stderr, "\n");
 
-	/* ④ Send packets via AF_XDP */
+	fprintf(stderr, "from  : %s\n", first_s);
+	fprintf(stderr, "to    : %s\n", last_s);
+	fprintf(stderr, "IPs   : %llu\n", (unsigned long long)dst_count);
+	if (cfg.ignore_from)
+		fprintf(stderr, "ignore: %s (skipping already-seen IPs)\n", cfg.ignore_from);
+	fprintf(stderr, "iface : %s  queue %u  src %s\n",
+		cfg.ifname, cfg.queue_id, src);
+	fprintf(stderr, "starting in 2s, Ctrl-C to cancel...\n");
+
 	uint64_t frame_idx = 0;
 	bool     send_ok   = true;
+
+	sleep(2);
+	if (!g_running)
+		goto cleanup;
+
+	fprintf(stderr, "sending %llu ICMP Echo frame(s)...\n",
+		(unsigned long long)total_frames);
+
+	/* ④ Send packets via AF_XDP */
 	for (uint32_t dst_ip = cfg.dst_start; g_running && send_ok; dst_ip++) {
+		if (ipdb_ignore_check(dst_ip)) {
+			if (dst_ip == cfg.dst_end) break;
+			continue;
+		}
+
 		cfg.dst_ip.s_addr = htonl(dst_ip);
 		char dst[INET_ADDRSTRLEN];
 		inet_ntop(AF_INET, &cfg.dst_ip, dst, sizeof(dst));
@@ -696,10 +729,13 @@ int main(int argc, char **argv)
 	}
 
 	g_running = 0;
-	pthread_join(reader_tid, NULL);
+	if (reader_started)
+		pthread_join(reader_tid, NULL);
 
 	fprintf(stderr, "%d unique IP(s) replied.\n", g_seen_count);
 
+cleanup:
+	ipdb_ignore_close();
 	ipdb_close();
 	xdp_unload();
 	return 0;

@@ -560,7 +560,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 		ipdb_mark(ntohl(key));
 		char ip_str[INET_ADDRSTRLEN];
 		inet_ntop(AF_INET, &key, ip_str, sizeof(ip_str));
-		printf("[reply] %s\n", ip_str);
+		putchar('.');
 		fflush(stdout);
 		if (g_seen_count < MAX_SEEN_IPS)
 			g_seen_ips[g_seen_count++] = key;
@@ -693,7 +693,7 @@ int main(int argc, char **argv)
 			char cur[INET_ADDRSTRLEN];
 			struct in_addr cur_a = {.s_addr = htonl(dst_ip)};
 			inet_ntop(AF_INET, &cur_a, cur, sizeof(cur));
-			fprintf(stderr, "[progress] %-20s  %llu / %llu IPs\n",
+			fprintf(stderr, "\n[progress] %-20s  %llu / %llu IPs\n",
 				cur,
 				(unsigned long long)offset,
 				(unsigned long long)dst_count);

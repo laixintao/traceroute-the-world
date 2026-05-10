@@ -133,7 +133,8 @@ static void usage(const char *prog)
 		"  --ttl N                  IP TTL, default: 64\n"
 		"  --reply-timeout-ms N     Wait after last send (ms), default: 3000\n"
 		"  --output PATH            reply bitmap file, default: %s\n"
-		"  --ignore-binary-from PATH  skip IPs already set in this ipdb file\n"
+		"  --ignore-binary-from PATH  seed output from this file; IPs already\n"
+		"                             set to 1 are skipped and preserved\n"
 		"  --bpf-obj PATH           eBPF object file, default: %s\n"
 		"  --copy                   Force XDP copy mode\n"
 		"  --zerocopy               Force XDP zero-copy mode\n"
@@ -609,24 +610,23 @@ int main(int argc, char **argv)
 		perror("get interface IPv4"); return 1;
 	}
 
-	/* ① Open reply bitmap */
+	/* ① Open reply bitmap (create if needed) */
 	if (ipdb_open(cfg.output) != 0)
 		return 1;
 	fprintf(stderr, "reply bitmap: %s\n", cfg.output);
 
-	/* ① Open ignore bitmap (optional) */
+	/* Seed output from ignore file so those IPs are skipped and preserved */
 	if (cfg.ignore_from) {
-		if (ipdb_ignore_open(cfg.ignore_from) != 0) {
+		if (ipdb_copy_from(cfg.ignore_from) != 0) {
 			ipdb_close();
 			return 1;
 		}
-		fprintf(stderr, "ignore bitmap: %s\n", cfg.ignore_from);
+		fprintf(stderr, "seeded from:  %s\n", cfg.ignore_from);
 	}
 
 	/* ② Load XDP program — intercepts and drops incoming ICMP replies */
 	int map_fd;
 	if (xdp_load(cfg.bpf_obj, ifindex, &map_fd) != 0) {
-		ipdb_ignore_close();
 		ipdb_close();
 		return 1;
 	}
@@ -698,7 +698,7 @@ int main(int argc, char **argv)
 				(unsigned long long)dst_count);
 		}
 
-		if (ipdb_ignore_check(dst_ip)) {
+		if (ipdb_check(dst_ip)) {
 			if (dst_ip == cfg.dst_end) break;
 			continue;
 		}
@@ -746,7 +746,6 @@ int main(int argc, char **argv)
 	fprintf(stderr, "%d unique IP(s) replied.\n", g_seen_count);
 
 cleanup:
-	ipdb_ignore_close();
 	ipdb_close();
 	xdp_unload();
 	return 0;

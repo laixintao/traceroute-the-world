@@ -11,13 +11,12 @@
 
 int  ipdb_open(const char *path);
 void ipdb_mark(uint32_t ip_host_order);
+bool ipdb_check(uint32_t ip_host_order);  /* true if already set */
 void ipdb_close(void);
 
 /*
- * Read-only view of an existing ipdb file used to skip already-known IPs.
- * ipdb_ignore_check() returns true if the IP should be skipped.
+ * Merge an existing ipdb file into the currently open output map.
+ * Any IP that is 1 in src_path will also become 1 in the output.
+ * Call after ipdb_open().
  */
-
-int  ipdb_ignore_open(const char *path);
-bool ipdb_ignore_check(uint32_t ip_host_order);
-void ipdb_ignore_close(void);
+int ipdb_copy_from(const char *src_path);

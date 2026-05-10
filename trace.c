@@ -514,9 +514,9 @@ static int xdp_load(const char *obj_path, int ifindex, int *map_fd_out)
 		return -1;
 	}
 
-	int map_fd = bpf_object__find_map_fd_by_name(obj, "icmp_reply_ips");
+	int map_fd = bpf_object__find_map_fd_by_name(obj, "icmp_reply_events");
 	if (map_fd < 0) {
-		fprintf(stderr, "map 'icmp_reply_ips' not found\n");
+		fprintf(stderr, "map 'icmp_reply_events' not found\n");
 		bpf_xdp_detach(ifindex, XDP_FLAGS_UPDATE_IF_NOEXIST, NULL);
 		bpf_object__close(obj);
 		return -1;
@@ -537,7 +537,11 @@ static void xdp_unload(void)
 	}
 }
 
-/* ── reader thread ───────────────────────────────────────────────────────── */
+/* ── ring buffer reader ──────────────────────────────────────────────────── */
+
+struct icmp_event {
+	uint32_t src_ip; /* network byte order */
+};
 
 static bool already_seen(uint32_t ip)
 {
@@ -546,43 +550,33 @@ static bool already_seen(uint32_t ip)
 	return false;
 }
 
-/* Drain the map: process every entry and delete it.
- * Always iterating from NULL is safe because we delete each key before
- * fetching the next, so the map shrinks and never fills up. */
-static void poll_map(int map_fd)
+static int handle_event(void *ctx, void *data, size_t data_sz)
 {
-	uint32_t key;
-	__u64    count;
-	char     ip_str[INET_ADDRSTRLEN];
+	(void)ctx; (void)data_sz;
+	const struct icmp_event *e = data;
+	uint32_t key = e->src_ip; /* network byte order */
 
-	while (bpf_map_get_next_key(map_fd, NULL, &key) == 0) {
-		if (bpf_map_lookup_elem(map_fd, &key, &count) == 0 &&
-		    !already_seen(key)) {
-			ipdb_mark(ntohl(key));
-			inet_ntop(AF_INET, &key, ip_str, sizeof(ip_str));
-			printf("[reply] %-20s (%llu packet(s))\n",
-			       ip_str, (unsigned long long)count);
-			fflush(stdout);
-			if (g_seen_count < MAX_SEEN_IPS)
-				g_seen_ips[g_seen_count++] = key;
-		}
-		/* Delete regardless — keeps the map drained so XDP can always
-		 * insert new entries.  ipdb_mark() is the persistent record. */
-		bpf_map_delete_elem(map_fd, &key);
+	if (!already_seen(key)) {
+		ipdb_mark(ntohl(key));
+		char ip_str[INET_ADDRSTRLEN];
+		inet_ntop(AF_INET, &key, ip_str, sizeof(ip_str));
+		printf("[reply] %s\n", ip_str);
+		fflush(stdout);
+		if (g_seen_count < MAX_SEEN_IPS)
+			g_seen_ips[g_seen_count++] = key;
 	}
+	return 0;
 }
 
 static void *reader_thread_fn(void *arg)
 {
-	int map_fd = *(int *)arg;
+	struct ring_buffer *rb = arg;
 
-	while (g_running) {
-		poll_map(map_fd);
-		usleep(1000); /* 1 ms */
-	}
+	while (g_running)
+		ring_buffer__poll(rb, 100 /* ms */);
 
-	/* final drain after g_running is cleared */
-	poll_map(map_fd);
+	/* final drain */
+	ring_buffer__poll(rb, 0);
 	return NULL;
 }
 
@@ -622,6 +616,7 @@ int main(int argc, char **argv)
 	}
 
 	/* ② Load XDP program — intercepts and drops incoming ICMP replies */
+	struct ring_buffer *rb = NULL;
 	int map_fd;
 	if (xdp_load(cfg.bpf_obj, ifindex, &map_fd) != 0) {
 		ipdb_close();
@@ -629,14 +624,23 @@ int main(int argc, char **argv)
 	}
 	fprintf(stderr, "XDP program loaded (%s)\n", cfg.bpf_obj);
 
+	struct ring_buffer *rb = ring_buffer__new(map_fd, handle_event, NULL, NULL);
+	if (!rb) {
+		fprintf(stderr, "ring_buffer__new failed\n");
+		ipdb_close();
+		xdp_unload();
+		return 1;
+	}
+
 	signal(SIGINT,  sig_handler);
 	signal(SIGTERM, sig_handler);
 
-	/* ② Start reader thread — polls BPF map and prints new responders */
+	/* ② Start reader thread — consumes ring buffer events */
 	pthread_t reader_tid;
 	bool      reader_started = false;
-	if (pthread_create(&reader_tid, NULL, reader_thread_fn, &map_fd) != 0) {
+	if (pthread_create(&reader_tid, NULL, reader_thread_fn, rb) != 0) {
 		perror("pthread_create");
+		ring_buffer__free(rb);
 		xdp_unload();
 		return 1;
 	}
@@ -743,6 +747,8 @@ int main(int argc, char **argv)
 	fprintf(stderr, "%d unique IP(s) replied.\n", g_seen_count);
 
 cleanup:
+	if (rb)
+		ring_buffer__free(rb);
 	ipdb_close();
 	xdp_unload();
 	return 0;

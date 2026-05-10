@@ -20,12 +20,14 @@ struct icmphdr {
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+struct icmp_event {
+	__u32 src_ip; /* IPv4 source address, network byte order */
+};
+
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 65536);
-	__type(key, __u32);   /* source IPv4 address (network byte order) */
-	__type(value, __u64); /* reply count */
-} icmp_reply_ips SEC(".maps");
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 1 << 22); /* 4 MiB — if full, events are dropped */
+} icmp_reply_events SEC(".maps");
 
 SEC("xdp")
 int xdp_drop_icmp_reply(struct xdp_md *ctx)
@@ -59,14 +61,13 @@ int xdp_drop_icmp_reply(struct xdp_md *ctx)
 	if (icmp->type != ICMP_ECHOREPLY)
 		return XDP_PASS;
 
-	__u32 src_ip = ip->saddr;
-	__u64 *count = bpf_map_lookup_elem(&icmp_reply_ips, &src_ip);
-	if (count) {
-		__sync_fetch_and_add(count, 1);
-	} else {
-		__u64 one = 1;
-		bpf_map_update_elem(&icmp_reply_ips, &src_ip, &one, BPF_NOEXIST);
+	struct icmp_event *e = bpf_ringbuf_reserve(&icmp_reply_events,
+						    sizeof(*e), 0);
+	if (e) {
+		e->src_ip = ip->saddr;
+		bpf_ringbuf_submit(e, 0);
 	}
+	/* if e == NULL the ring is full; event is dropped, packet still dropped */
 
 	return XDP_DROP;
 }

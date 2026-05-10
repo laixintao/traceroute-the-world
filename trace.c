@@ -546,24 +546,18 @@ static bool already_seen(uint32_t ip)
 	return false;
 }
 
-/* Drain whatever is currently in the map, printing newly seen IPs. */
+/* Drain the map: process every entry and delete it.
+ * Always iterating from NULL is safe because we delete each key before
+ * fetching the next, so the map shrinks and never fills up. */
 static void poll_map(int map_fd)
 {
-	uint32_t key = 0, next_key;
+	uint32_t key;
 	__u64    count;
 	char     ip_str[INET_ADDRSTRLEN];
-	bool     first = true;
 
-	while (bpf_map_get_next_key(map_fd,
-				    first ? NULL : &key,
-				    &next_key) == 0) {
-		first = false;
-		key   = next_key;
-
-		if (bpf_map_lookup_elem(map_fd, &key, &count) != 0)
-			continue;
-
-		if (!already_seen(key)) {
+	while (bpf_map_get_next_key(map_fd, NULL, &key) == 0) {
+		if (bpf_map_lookup_elem(map_fd, &key, &count) == 0 &&
+		    !already_seen(key)) {
 			ipdb_mark(ntohl(key));
 			inet_ntop(AF_INET, &key, ip_str, sizeof(ip_str));
 			printf("[reply] %-20s (%llu packet(s))\n",
@@ -572,6 +566,9 @@ static void poll_map(int map_fd)
 			if (g_seen_count < MAX_SEEN_IPS)
 				g_seen_ips[g_seen_count++] = key;
 		}
+		/* Delete regardless — keeps the map drained so XDP can always
+		 * insert new entries.  ipdb_mark() is the persistent record. */
+		bpf_map_delete_elem(map_fd, &key);
 	}
 }
 

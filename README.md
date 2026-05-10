@@ -1,8 +1,8 @@
 # AF_XDP ICMP sender
 
-This is a minimal AF_XDP transmit-only ICMP Echo sender. It bypasses the normal
-kernel network data path for packet transmission by writing complete Ethernet
-frames into an AF_XDP TX ring.
+This is a minimal AF_XDP ICMP Echo sender. It bypasses the normal kernel
+network data path for packet transmission by writing complete Ethernet frames
+into an AF_XDP TX ring.
 
 It intentionally does not use libbpf or libxdp, so it only needs Linux UAPI
 headers and a C compiler.
@@ -43,7 +43,8 @@ Useful options:
 
 AF_XDP support depends on the NIC driver and queue setup. If `bind(AF_XDP)`
 fails with `EINVAL`, try `--copy` first. For zero-copy mode, the NIC driver must
-support AF_XDP zero-copy on the selected queue.
+support AF_XDP zero-copy on the selected queue. This program does not fall back
+to AF_PACKET.
 
 This program sends ICMP Echo packets only. It does not attach an XDP program and
 does not receive Echo Replies.

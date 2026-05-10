@@ -9,7 +9,6 @@
 #include <linux/ip.h>
 #include <linux/icmp.h>
 #include <netinet/in.h>
-#include <netpacket/packet.h>
 #include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -30,6 +29,8 @@
 #define FRAME_SIZE 2048U
 #define NUM_FRAMES 4096U
 #define RING_SIZE 2048U
+#define TX_FRAME_BASE RING_SIZE
+#define TX_NUM_FRAMES (NUM_FRAMES - TX_FRAME_BASE)
 #define DEFAULT_PAYLOAD_LEN 32U
 #define DEFAULT_INTERVAL_USEC 1000000U
 
@@ -67,7 +68,9 @@ struct xsk_socket {
 	int fd;
 	void *umem;
 	size_t umem_len;
+	struct xsk_ring rx;
 	struct xsk_ring tx;
+	struct xsk_ring fq;
 	struct xsk_ring cq;
 };
 
@@ -281,6 +284,11 @@ static void ring_release(struct xsk_ring *r, uint32_t n)
 	__atomic_store_n(r->consumer, *r->consumer + n, __ATOMIC_RELEASE);
 }
 
+static void ring_submit(struct xsk_ring *r, uint32_t n)
+{
+	__atomic_store_n(r->producer, *r->producer + n, __ATOMIC_RELEASE);
+}
+
 static int mmap_ring(int fd, struct xsk_ring *ring, const struct xdp_ring_offset *off,
 		     uint32_t ndesc, off_t pgoff, size_t desc_size)
 {
@@ -305,9 +313,6 @@ static int xsk_open(struct xsk_socket *xsk, const struct app_config *cfg, int if
 	if (xsk->fd < 0)
 		return -1;
 
-	int one = 1;
-	setsockopt(xsk->fd, SOL_XDP, XDP_USE_NEED_WAKEUP, &one, sizeof(one));
-
 	xsk->umem_len = NUM_FRAMES * FRAME_SIZE;
 	if (posix_memalign(&xsk->umem, getpagesize(), xsk->umem_len) != 0) {
 		errno = ENOMEM;
@@ -324,7 +329,12 @@ static int xsk_open(struct xsk_socket *xsk, const struct app_config *cfg, int if
 	};
 	if (setsockopt(xsk->fd, SOL_XDP, XDP_UMEM_REG, &mr, sizeof(mr)) < 0)
 		return -1;
+	if (setsockopt(xsk->fd, SOL_XDP, XDP_RX_RING, &(uint32_t){RING_SIZE}, sizeof(uint32_t)) < 0)
+		return -1;
 	if (setsockopt(xsk->fd, SOL_XDP, XDP_TX_RING, &(uint32_t){RING_SIZE}, sizeof(uint32_t)) < 0)
+		return -1;
+	if (setsockopt(xsk->fd, SOL_XDP, XDP_UMEM_FILL_RING,
+		       &(uint32_t){RING_SIZE}, sizeof(uint32_t)) < 0)
 		return -1;
 	if (setsockopt(xsk->fd, SOL_XDP, XDP_UMEM_COMPLETION_RING,
 		       &(uint32_t){RING_SIZE}, sizeof(uint32_t)) < 0)
@@ -335,15 +345,28 @@ static int xsk_open(struct xsk_socket *xsk, const struct app_config *cfg, int if
 	if (getsockopt(xsk->fd, SOL_XDP, XDP_MMAP_OFFSETS, &off, &optlen) < 0)
 		return -1;
 
+	if (mmap_ring(xsk->fd, &xsk->rx, &off.rx, RING_SIZE,
+		      XDP_PGOFF_RX_RING, sizeof(struct xdp_desc)) < 0)
+		return -1;
 	if (mmap_ring(xsk->fd, &xsk->tx, &off.tx, RING_SIZE,
 		      XDP_PGOFF_TX_RING, sizeof(struct xdp_desc)) < 0)
+		return -1;
+	if (mmap_ring(xsk->fd, &xsk->fq, &off.fr, RING_SIZE,
+		      XDP_UMEM_PGOFF_FILL_RING, sizeof(uint64_t)) < 0)
 		return -1;
 	if (mmap_ring(xsk->fd, &xsk->cq, &off.cr, RING_SIZE,
 		      XDP_UMEM_PGOFF_COMPLETION_RING, sizeof(uint64_t)) < 0)
 		return -1;
 
+	uint64_t *fq = xsk->fq.desc;
+	uint32_t prod = *xsk->fq.producer;
+	for (uint32_t i = 0; i < RING_SIZE; i++)
+		fq[(prod + i) & xsk->fq.mask] = (uint64_t)i * FRAME_SIZE;
+	ring_submit(&xsk->fq, RING_SIZE);
+
 	struct sockaddr_xdp sxdp = {
 		.sxdp_family = AF_XDP,
+		.sxdp_flags = XDP_USE_NEED_WAKEUP,
 		.sxdp_ifindex = (uint32_t)ifindex,
 		.sxdp_queue_id = cfg->queue_id,
 	};
@@ -375,7 +398,7 @@ static int send_one(struct xsk_socket *xsk, const struct app_config *cfg, uint32
 	}
 
 	uint32_t idx = *xsk->tx.producer & xsk->tx.mask;
-	uint64_t addr = (uint64_t)frame_idx * FRAME_SIZE;
+	uint64_t addr = (uint64_t)(TX_FRAME_BASE + (frame_idx % TX_NUM_FRAMES)) * FRAME_SIZE;
 	uint8_t *pkt = (uint8_t *)xsk->umem + addr;
 	size_t len = build_icmp_frame(pkt, cfg, seq);
 
@@ -391,41 +414,6 @@ static int send_one(struct xsk_socket *xsk, const struct app_config *cfg, uint32
 			return -1;
 	}
 	return 0;
-}
-
-static int packet_send_loop(const struct app_config *cfg, int ifindex)
-{
-	int fd = socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC, htons(ETH_P_IP));
-	if (fd < 0)
-		return -1;
-
-	uint8_t frame[sizeof(struct ethhdr) + sizeof(struct iphdr) +
-		      sizeof(struct icmphdr) + 1400];
-	struct sockaddr_ll sa = {
-		.sll_family = AF_PACKET,
-		.sll_protocol = htons(ETH_P_IP),
-		.sll_ifindex = ifindex,
-		.sll_halen = ETH_ALEN,
-	};
-	memcpy(sa.sll_addr, cfg->dst_mac, ETH_ALEN);
-
-	for (uint32_t i = 0; i < cfg->count; i++) {
-		size_t len = build_icmp_frame(frame, cfg, (uint16_t)(i + 1));
-		if (sendto(fd, frame, len, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-			close(fd);
-			return -1;
-		}
-		if (!cfg->busy && cfg->interval_usec)
-			usleep(cfg->interval_usec);
-	}
-
-	close(fd);
-	return 0;
-}
-
-static bool af_xdp_unsupported_errno(int err)
-{
-	return err == EINVAL || err == EOPNOTSUPP || err == ENOTSUP;
 }
 
 int main(int argc, char **argv)
@@ -450,22 +438,6 @@ int main(int argc, char **argv)
 
 	struct xsk_socket xsk;
 	if (xsk_open(&xsk, &cfg, ifindex) != 0) {
-		int setup_errno = errno;
-		if (!cfg.force_zerocopy && af_xdp_unsupported_errno(setup_errno)) {
-			char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
-			inet_ntop(AF_INET, &cfg.src_ip, src, sizeof(src));
-			inet_ntop(AF_INET, &cfg.dst_ip, dst, sizeof(dst));
-			fprintf(stderr,
-				"AF_XDP setup failed (%s); falling back to AF_PACKET TX on %s: %s -> %s\n",
-				strerror(setup_errno), cfg.ifname, src, dst);
-			if (packet_send_loop(&cfg, ifindex) != 0) {
-				perror("AF_PACKET send");
-				return 1;
-			}
-			fprintf(stderr, "done\n");
-			return 0;
-		}
-		errno = setup_errno;
 		perror("AF_XDP setup");
 		return 1;
 	}

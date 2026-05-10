@@ -29,6 +29,7 @@
 *.dylib
 
 # Executables
+/af_xdp_ping
 *.exe
 *.out
 *.app

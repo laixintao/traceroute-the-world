@@ -60,8 +60,11 @@ struct app_config {
 	bool have_dst_mac;
 	struct in_addr src_ip;
 	struct in_addr dst_ip;
+	uint32_t dst_start;
+	uint32_t dst_end;
 	bool have_src_ip;
 	bool have_dst_ip;
+	bool have_dst_subnet;
 };
 
 struct xsk_socket {
@@ -83,7 +86,8 @@ static void usage(const char *prog)
 		"  --src-ip A.B.C.D       Source IPv4 address, default: interface IPv4\n"
 		"  --src-mac xx:..:xx     Source MAC, default: interface MAC\n"
 		"  --queue N              TX queue id, default: 0\n"
-		"  --count N              Packet count, default: 4\n"
+		"  --dst-subnet CIDR      Send to every IPv4 address in CIDR instead of --dst-ip\n"
+		"  --count N              Packet count per destination, default: 4\n"
 		"  --interval-usec N      Delay between packets, default: 1000000\n"
 		"  --payload-len N        ICMP payload length, default: 32\n"
 		"  --copy                 Force XDP copy mode\n"
@@ -118,6 +122,33 @@ static int parse_mac(const char *s, uint8_t mac[ETH_ALEN])
 	return 0;
 }
 
+static int parse_cidr(const char *s, uint32_t *start, uint32_t *end)
+{
+	char buf[INET_ADDRSTRLEN + 4];
+	if (strlen(s) >= sizeof(buf))
+		return -1;
+	snprintf(buf, sizeof(buf), "%s", s);
+
+	char *slash = strchr(buf, '/');
+	if (!slash || slash == buf || slash[1] == '\0')
+		return -1;
+	*slash++ = '\0';
+
+	struct in_addr addr;
+	if (inet_pton(AF_INET, buf, &addr) != 1)
+		return -1;
+
+	unsigned long prefix = parse_ulong(slash, "dst-subnet prefix");
+	if (prefix > 32)
+		return -1;
+
+	uint32_t ip = ntohl(addr.s_addr);
+	uint32_t mask = prefix == 0 ? 0 : UINT32_MAX << (32 - prefix);
+	*start = ip & mask;
+	*end = *start | ~mask;
+	return 0;
+}
+
 static void parse_args(int argc, char **argv, struct app_config *cfg)
 {
 	cfg->queue_id = 0;
@@ -148,6 +179,12 @@ static void parse_args(int argc, char **argv, struct app_config *cfg)
 				exit(2);
 			}
 			cfg->have_dst_ip = true;
+		} else if (!strcmp(argv[i], "--dst-subnet") && i + 1 < argc) {
+			if (parse_cidr(argv[++i], &cfg->dst_start, &cfg->dst_end) != 0) {
+				fprintf(stderr, "invalid --dst-subnet\n");
+				exit(2);
+			}
+			cfg->have_dst_subnet = true;
 		} else if (!strcmp(argv[i], "--src-mac") && i + 1 < argc) {
 			if (parse_mac(argv[++i], cfg->src_mac) != 0) {
 				fprintf(stderr, "invalid --src-mac\n");
@@ -175,7 +212,12 @@ static void parse_args(int argc, char **argv, struct app_config *cfg)
 		}
 	}
 
-	if (!cfg->ifname || !cfg->have_dst_ip || !cfg->have_dst_mac ||
+	if (cfg->have_dst_ip) {
+		cfg->dst_start = ntohl(cfg->dst_ip.s_addr);
+		cfg->dst_end = cfg->dst_start;
+	}
+
+	if (!cfg->ifname || cfg->have_dst_ip == cfg->have_dst_subnet || !cfg->have_dst_mac ||
 	    cfg->payload_len > 1400 || (cfg->force_copy && cfg->force_zerocopy)) {
 		usage(argv[0]);
 		exit(2);
@@ -444,18 +486,36 @@ int main(int argc, char **argv)
 
 	char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
 	inet_ntop(AF_INET, &cfg.src_ip, src, sizeof(src));
-	inet_ntop(AF_INET, &cfg.dst_ip, dst, sizeof(dst));
-	fprintf(stderr, "sending %u ICMP Echo frames on %s queue %u: %s -> %s\n",
-		cfg.count, cfg.ifname, cfg.queue_id, src, dst);
+	uint64_t dst_count = (uint64_t)cfg.dst_end - cfg.dst_start + 1;
+	uint64_t total_frames = dst_count * cfg.count;
+	struct in_addr first = {.s_addr = htonl(cfg.dst_start)};
+	struct in_addr last = {.s_addr = htonl(cfg.dst_end)};
+	char first_s[INET_ADDRSTRLEN], last_s[INET_ADDRSTRLEN];
+	inet_ntop(AF_INET, &first, first_s, sizeof(first_s));
+	inet_ntop(AF_INET, &last, last_s, sizeof(last_s));
+	fprintf(stderr,
+		"sending %llu ICMP Echo frames on %s queue %u: %s -> %s",
+		(unsigned long long)total_frames, cfg.ifname, cfg.queue_id, src, first_s);
+	if (cfg.dst_start != cfg.dst_end)
+		fprintf(stderr, "-%s", last_s);
+	fprintf(stderr, "\n");
 
-	for (uint32_t i = 0; i < cfg.count; i++) {
-		if (send_one(&xsk, &cfg, i % NUM_FRAMES, (uint16_t)(i + 1)) != 0) {
-			perror("send");
-			return 1;
+	uint64_t frame_idx = 0;
+	for (uint32_t dst_ip = cfg.dst_start;; dst_ip++) {
+		cfg.dst_ip.s_addr = htonl(dst_ip);
+		inet_ntop(AF_INET, &cfg.dst_ip, dst, sizeof(dst));
+		for (uint32_t i = 0; i < cfg.count; i++) {
+			if (send_one(&xsk, &cfg, (uint32_t)frame_idx, (uint16_t)(frame_idx + 1)) != 0) {
+				fprintf(stderr, "send to %s: %s\n", dst, strerror(errno));
+				return 1;
+			}
+			frame_idx++;
+			reap_completions(&xsk);
+			if (!cfg.busy && cfg.interval_usec)
+				usleep(cfg.interval_usec);
 		}
-		reap_completions(&xsk);
-		if (!cfg.busy && cfg.interval_usec)
-			usleep(cfg.interval_usec);
+		if (dst_ip == cfg.dst_end)
+			break;
 	}
 
 	for (int i = 0; i < 100; i++) {

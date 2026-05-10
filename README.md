@@ -25,13 +25,25 @@ sudo ./af_xdp_ping \
   --dst-mac 02:00:00:00:00:02
 ```
 
+To send one ICMP Echo packet to every address in a subnet:
+
+```sh
+sudo ./af_xdp_ping \
+  --dev eth0 \
+  --dst-subnet 192.0.2.0/24 \
+  --dst-mac 02:00:00:00:00:02 \
+  --count 1 \
+  --busy
+```
+
 Useful options:
 
 ```text
 --src-ip A.B.C.D       Source IPv4 address. Defaults to the interface IPv4.
 --src-mac xx:..:xx     Source MAC. Defaults to the interface MAC.
 --queue N              TX queue id. Default: 0.
---count N              Number of ICMP Echo packets. Default: 4.
+--dst-subnet CIDR      Send to every IPv4 address in CIDR instead of --dst-ip.
+--count N              Number of ICMP Echo packets per destination. Default: 4.
 --interval-usec N      Delay between packets. Default: 1000000.
 --payload-len N        ICMP payload length. Default: 32.
 --copy                 Force XDP copy mode.

@@ -10,11 +10,12 @@ LIBBPF_LDFLAGS ?= -lbpf -lelf -lz -lpthread
 
 TARGET   := trace
 DUMP     := ipdump
+COUNT    := ipcount
 XDP_KERN := icmp_reply_drop_kern.o
 
 .PHONY: all clean
 
-all: $(TARGET) $(DUMP) $(XDP_KERN)
+all: $(TARGET) $(DUMP) $(COUNT) $(XDP_KERN)
 
 $(TARGET): trace.c ipdb.c ipdb.h
 	$(CC) $(CFLAGS) $(LIBBPF_CFLAGS) -o $@ trace.c ipdb.c $(LDFLAGS) $(LIBBPF_LDFLAGS)
@@ -22,8 +23,11 @@ $(TARGET): trace.c ipdb.c ipdb.h
 $(DUMP): ipdump.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
+$(COUNT): ipcount.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
 $(XDP_KERN): icmp_reply_drop_kern.c
 	$(CLANG) -O2 -g -Wall -target bpf $(LIBBPF_CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(TARGET) $(DUMP) $(XDP_KERN)
+	rm -f $(TARGET) $(DUMP) $(COUNT) $(XDP_KERN)

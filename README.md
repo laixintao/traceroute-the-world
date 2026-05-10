@@ -129,6 +129,7 @@ sudo ./trace \
 --payload-len N          ICMP payload bytes, default: 32
 --ttl N                  IP TTL (1-255), default: 64
 --reply-timeout-ms N     Time to wait after last send (ms), default: 3000
+--output PATH            reply bitmap file, default: replies.bin
 --bpf-obj PATH           eBPF object file, default: icmp_reply_drop_kern.o
 --copy                   Force XDP copy mode
 --zerocopy               Force XDP zero-copy mode
@@ -148,3 +149,12 @@ sudo ./trace \
 - Replies are intercepted and dropped by the XDP hook before the kernel
   sees them, so `ping` or other tools on the same host will not receive
   those replies while `trace` is running.
+- The reply bitmap (`replies.bin` by default) is a 4 GiB sparse file.
+  Byte at offset `ntohl(src_ip)` is set to `1` when that host replied.
+  The file persists across runs (results accumulate); delete it to start
+  fresh. To check whether `192.168.1.1` replied:
+  ```python
+  with open("replies.bin", "rb") as f:
+      f.seek(0xC0A80101)   # 192.168.1.1 in host byte order
+      print(f.read(1) == b'\x01')
+  ```

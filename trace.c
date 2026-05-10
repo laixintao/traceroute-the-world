@@ -25,6 +25,7 @@
 #include <unistd.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
+#include "ipdb.h"
 
 #ifndef AF_XDP
 #define AF_XDP 44
@@ -40,6 +41,7 @@
 #define DEFAULT_REPLY_TIMEOUT_MS 3000U
 #define DEFAULT_TTL             64U
 #define DEFAULT_BPF_OBJ         "icmp_reply_drop_kern.o"
+#define DEFAULT_OUTPUT          "replies.bin"
 #define MAX_SEEN_IPS            65536
 
 extern unsigned int if_nametoindex(const char *ifname);
@@ -70,6 +72,7 @@ struct xsk_socket {
 struct app_config {
 	const char    *ifname;
 	const char    *bpf_obj;
+	const char    *output;
 	uint32_t       queue_id;
 	uint32_t       count;
 	uint32_t       interval_usec;
@@ -128,11 +131,12 @@ static void usage(const char *prog)
 		"  --payload-len N          ICMP payload bytes, default: 32\n"
 		"  --ttl N                  IP TTL, default: 64\n"
 		"  --reply-timeout-ms N     Wait after last send (ms), default: 3000\n"
+		"  --output PATH            reply bitmap file, default: %s\n"
 		"  --bpf-obj PATH           eBPF object file, default: %s\n"
 		"  --copy                   Force XDP copy mode\n"
 		"  --zerocopy               Force XDP zero-copy mode\n"
 		"  --busy                   Send without sleeping between packets\n",
-		prog, DEFAULT_BPF_OBJ);
+		prog, DEFAULT_OUTPUT, DEFAULT_BPF_OBJ);
 }
 
 static unsigned long parse_ulong(const char *s, const char *name)
@@ -191,6 +195,7 @@ static void parse_args(int argc, char **argv, struct app_config *cfg)
 	cfg->payload_len       = DEFAULT_PAYLOAD_LEN;
 	cfg->ttl               = DEFAULT_TTL;
 	cfg->reply_timeout_ms  = DEFAULT_REPLY_TIMEOUT_MS;
+	cfg->output            = DEFAULT_OUTPUT;
 	cfg->bpf_obj           = DEFAULT_BPF_OBJ;
 
 	for (int i = 1; i < argc; i++) {
@@ -208,6 +213,8 @@ static void parse_args(int argc, char **argv, struct app_config *cfg)
 			cfg->ttl = (uint32_t)parse_ulong(argv[++i], "ttl");
 		} else if (!strcmp(argv[i], "--reply-timeout-ms") && i + 1 < argc) {
 			cfg->reply_timeout_ms = (uint32_t)parse_ulong(argv[++i], "reply-timeout-ms");
+		} else if (!strcmp(argv[i], "--output") && i + 1 < argc) {
+			cfg->output = argv[++i];
 		} else if (!strcmp(argv[i], "--bpf-obj") && i + 1 < argc) {
 			cfg->bpf_obj = argv[++i];
 		} else if (!strcmp(argv[i], "--src-ip") && i + 1 < argc) {
@@ -552,6 +559,7 @@ static void poll_map(int map_fd)
 			continue;
 
 		if (!already_seen(key)) {
+			ipdb_mark(ntohl(key));
 			inet_ntop(AF_INET, &key, ip_str, sizeof(ip_str));
 			printf("[reply] %-20s (%llu packet(s))\n",
 			       ip_str, (unsigned long long)count);
@@ -568,7 +576,7 @@ static void *reader_thread_fn(void *arg)
 
 	while (g_running) {
 		poll_map(map_fd);
-		usleep(100000); /* 100 ms */
+		usleep(1000); /* 1 ms */
 	}
 
 	/* final drain after g_running is cleared */
@@ -597,10 +605,17 @@ int main(int argc, char **argv)
 		perror("get interface IPv4"); return 1;
 	}
 
-	/* ① Load XDP program — intercepts and drops incoming ICMP replies */
-	int map_fd;
-	if (xdp_load(cfg.bpf_obj, ifindex, &map_fd) != 0)
+	/* ① Open reply bitmap */
+	if (ipdb_open(cfg.output) != 0)
 		return 1;
+	fprintf(stderr, "reply bitmap: %s\n", cfg.output);
+
+	/* ② Load XDP program — intercepts and drops incoming ICMP replies */
+	int map_fd;
+	if (xdp_load(cfg.bpf_obj, ifindex, &map_fd) != 0) {
+		ipdb_close();
+		return 1;
+	}
 	fprintf(stderr, "XDP program loaded (%s)\n", cfg.bpf_obj);
 
 	signal(SIGINT,  sig_handler);
@@ -685,6 +700,7 @@ int main(int argc, char **argv)
 
 	fprintf(stderr, "%d unique IP(s) replied.\n", g_seen_count);
 
+	ipdb_close();
 	xdp_unload();
 	return 0;
 }

@@ -15,8 +15,8 @@ XDP_KERN := icmp_reply_drop_kern.o
 
 all: $(TARGET) $(XDP_KERN)
 
-$(TARGET): trace.c
-	$(CC) $(CFLAGS) $(LIBBPF_CFLAGS) -o $@ $< $(LDFLAGS) $(LIBBPF_LDFLAGS)
+$(TARGET): trace.c ipdb.c ipdb.h
+	$(CC) $(CFLAGS) $(LIBBPF_CFLAGS) -o $@ trace.c ipdb.c $(LDFLAGS) $(LIBBPF_LDFLAGS)
 
 $(XDP_KERN): icmp_reply_drop_kern.c
 	$(CLANG) -O2 -g -Wall -target bpf $(LIBBPF_CFLAGS) -c $< -o $@

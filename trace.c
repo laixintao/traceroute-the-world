@@ -79,6 +79,7 @@ struct app_config {
 	uint32_t       payload_len;
 	uint32_t       ttl;
 	uint32_t       reply_timeout_ms;
+	uint32_t       rounds;
 	bool           busy;
 	bool           force_copy;
 	bool           force_zerocopy;
@@ -130,6 +131,8 @@ static void usage(const char *prog)
 		"  --payload-len N          ICMP payload bytes, default: 32\n"
 		"  --ttl N                  IP TTL, default: 64\n"
 		"  --reply-timeout-ms N     Wait after last send (ms), default: 3000\n"
+		"  --round N                Repeat scan N times; IPs that replied are\n"
+		"                           skipped in subsequent rounds, default: 1\n"
 		"  --output PATH            reply bitmap file, default: %s\n"
 		"  --ignore-binary-from PATH  seed output from this file; IPs already\n"
 		"                             set to 1 are skipped and preserved\n"
@@ -196,6 +199,7 @@ static void parse_args(int argc, char **argv, struct app_config *cfg)
 	cfg->payload_len       = DEFAULT_PAYLOAD_LEN;
 	cfg->ttl               = DEFAULT_TTL;
 	cfg->reply_timeout_ms  = DEFAULT_REPLY_TIMEOUT_MS;
+	cfg->rounds            = 1;
 	cfg->output            = DEFAULT_OUTPUT;
 	cfg->bpf_obj           = DEFAULT_BPF_OBJ;
 
@@ -214,6 +218,9 @@ static void parse_args(int argc, char **argv, struct app_config *cfg)
 			cfg->ttl = (uint32_t)parse_ulong(argv[++i], "ttl");
 		} else if (!strcmp(argv[i], "--reply-timeout-ms") && i + 1 < argc) {
 			cfg->reply_timeout_ms = (uint32_t)parse_ulong(argv[++i], "reply-timeout-ms");
+		} else if (!strcmp(argv[i], "--round") && i + 1 < argc) {
+			cfg->rounds = (uint32_t)parse_ulong(argv[++i], "round");
+			if (cfg->rounds < 1) { fprintf(stderr, "--round must be >= 1\n"); exit(2); }
 		} else if (!strcmp(argv[i], "--output") && i + 1 < argc) {
 			cfg->output = argv[++i];
 		} else if (!strcmp(argv[i], "--ignore-binary-from") && i + 1 < argc) {
@@ -692,6 +699,8 @@ int main(int argc, char **argv)
 		fprintf(stderr, "ignore: %s (skipping already-seen IPs)\n", cfg.ignore_from);
 	fprintf(stderr, "iface : %s  queue %u  src %s\n",
 		cfg.ifname, cfg.queue_id, src);
+	if (cfg.rounds > 1)
+		fprintf(stderr, "rounds: %u\n", cfg.rounds);
 	fprintf(stderr, "starting in 2s, Ctrl-C to cancel...\n");
 
 	uint64_t frame_idx = 0;
@@ -701,61 +710,66 @@ int main(int argc, char **argv)
 	if (!g_running)
 		goto cleanup;
 
-	fprintf(stderr, "sending %llu ICMP Echo frame(s)...\n",
-		(unsigned long long)total_frames);
+	for (uint32_t round = 1; round <= cfg.rounds && g_running && send_ok; round++) {
+		if (cfg.rounds > 1)
+			fprintf(stderr, "\n=== round %u / %u ===\n", round, cfg.rounds);
 
-	/* ④ Send packets via AF_XDP */
-	for (uint32_t dst_ip = cfg.dst_start; g_running && send_ok; dst_ip++) {
-		uint64_t offset = (uint64_t)(dst_ip - cfg.dst_start);
-		if (offset > 0 && offset % (256 * 256) == 0) {
-			char cur[INET_ADDRSTRLEN];
-			struct in_addr cur_a = {.s_addr = htonl(dst_ip)};
-			inet_ntop(AF_INET, &cur_a, cur, sizeof(cur));
-			fprintf(stderr, "\n[progress] %-20s  %llu / %llu IPs\n",
-				cur,
-				(unsigned long long)offset,
-				(unsigned long long)dst_count);
-		}
+		fprintf(stderr, "sending %llu ICMP Echo frame(s)...\n",
+			(unsigned long long)total_frames);
 
-		if (ipdb_check(dst_ip)) {
-			if (dst_ip == cfg.dst_end) break;
-			continue;
-		}
-
-		cfg.dst_ip.s_addr = htonl(dst_ip);
-		char dst[INET_ADDRSTRLEN];
-		inet_ntop(AF_INET, &cfg.dst_ip, dst, sizeof(dst));
-
-		for (uint32_t i = 0; i < cfg.count && g_running; i++) {
-			if (send_one(&xsk, &cfg, (uint32_t)frame_idx,
-				     (uint16_t)(frame_idx + 1)) != 0) {
-				fprintf(stderr, "send to %s: %s\n", dst, strerror(errno));
-				send_ok = false;
-				break;
+		/* ④ Send packets via AF_XDP */
+		for (uint32_t dst_ip = cfg.dst_start; g_running && send_ok; dst_ip++) {
+			uint64_t offset = (uint64_t)(dst_ip - cfg.dst_start);
+			if (offset > 0 && offset % (256 * 256) == 0) {
+				char cur[INET_ADDRSTRLEN];
+				struct in_addr cur_a = {.s_addr = htonl(dst_ip)};
+				inet_ntop(AF_INET, &cur_a, cur, sizeof(cur));
+				fprintf(stderr, "\n[progress] %-20s  %llu / %llu IPs\n",
+					cur,
+					(unsigned long long)offset,
+					(unsigned long long)dst_count);
 			}
-			frame_idx++;
-			reap_completions(&xsk);
-			if (!cfg.busy && cfg.interval_usec)
-				usleep(cfg.interval_usec);
+
+			if (ipdb_check(dst_ip)) {
+				if (dst_ip == cfg.dst_end) break;
+				continue;
+			}
+
+			cfg.dst_ip.s_addr = htonl(dst_ip);
+			char dst[INET_ADDRSTRLEN];
+			inet_ntop(AF_INET, &cfg.dst_ip, dst, sizeof(dst));
+
+			for (uint32_t i = 0; i < cfg.count && g_running; i++) {
+				if (send_one(&xsk, &cfg, (uint32_t)frame_idx,
+					     (uint16_t)(frame_idx + 1)) != 0) {
+					fprintf(stderr, "send to %s: %s\n", dst, strerror(errno));
+					send_ok = false;
+					break;
+				}
+				frame_idx++;
+				reap_completions(&xsk);
+				if (!cfg.busy && cfg.interval_usec)
+					usleep(cfg.interval_usec);
+			}
+			if (dst_ip == cfg.dst_end) break;
 		}
-		if (dst_ip == cfg.dst_end) break;
-	}
 
-	/* Drain TX completions */
-	for (int i = 0; i < 100 && *xsk.cq.consumer != *xsk.tx.producer; i++) {
-		reap_completions(&xsk);
-		struct pollfd pfd = {.fd = xsk.fd, .events = POLLOUT};
-		(void)poll(&pfd, 1, 10);
-	}
+		/* Drain TX completions */
+		for (int i = 0; i < 100 && *xsk.cq.consumer != *xsk.tx.producer; i++) {
+			reap_completions(&xsk);
+			struct pollfd pfd = {.fd = xsk.fd, .events = POLLOUT};
+			(void)poll(&pfd, 1, 10);
+		}
 
-	/* ⑤ Wait for replies */
-	fprintf(stderr, "all packets sent, waiting %u ms for replies...\n",
-		cfg.reply_timeout_ms);
-	uint32_t remaining = cfg.reply_timeout_ms;
-	while (g_running && remaining > 0) {
-		uint32_t slice = remaining < 100 ? remaining : 100;
-		usleep((useconds_t)slice * 1000);
-		remaining -= slice;
+		/* ⑤ Wait for replies */
+		fprintf(stderr, "all packets sent, waiting %u ms for replies...\n",
+			cfg.reply_timeout_ms);
+		uint32_t remaining = cfg.reply_timeout_ms;
+		while (g_running && remaining > 0) {
+			uint32_t slice = remaining < 100 ? remaining : 100;
+			usleep((useconds_t)slice * 1000);
+			remaining -= slice;
+		}
 	}
 
 	g_running = 0;

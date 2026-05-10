@@ -2,7 +2,8 @@
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
-/* Inline ICMP definitions to avoid linux/if.h -> sys/socket.h under -target bpf */
+/* Inline definitions to avoid userspace headers under -target bpf */
+#define IPPROTO_ICMP    1
 #define ICMP_ECHOREPLY  0
 #define ICMP_ECHO       8
 struct icmphdr {

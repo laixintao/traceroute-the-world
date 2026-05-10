@@ -624,7 +624,7 @@ int main(int argc, char **argv)
 	}
 	fprintf(stderr, "XDP program loaded (%s)\n", cfg.bpf_obj);
 
-	struct ring_buffer *rb = ring_buffer__new(map_fd, handle_event, NULL, NULL);
+	rb = ring_buffer__new(map_fd, handle_event, NULL, NULL);
 	if (!rb) {
 		fprintf(stderr, "ring_buffer__new failed\n");
 		ipdb_close();

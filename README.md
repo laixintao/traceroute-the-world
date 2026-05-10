@@ -127,6 +127,7 @@ sudo ./trace \
 --count N                ICMP Echo packets per destination, default: 4
 --interval-usec N        Delay between packets (µs), default: 1000000
 --payload-len N          ICMP payload bytes, default: 32
+--ttl N                  IP TTL (1-255), default: 64
 --reply-timeout-ms N     Time to wait after last send (ms), default: 3000
 --bpf-obj PATH           eBPF object file, default: icmp_reply_drop_kern.o
 --copy                   Force XDP copy mode

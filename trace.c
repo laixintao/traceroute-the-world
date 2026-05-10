@@ -38,6 +38,7 @@
 #define DEFAULT_PAYLOAD_LEN     32U
 #define DEFAULT_INTERVAL_USEC   1000000U
 #define DEFAULT_REPLY_TIMEOUT_MS 3000U
+#define DEFAULT_TTL             64U
 #define DEFAULT_BPF_OBJ         "icmp_reply_drop_kern.o"
 #define MAX_SEEN_IPS            65536
 
@@ -73,6 +74,7 @@ struct app_config {
 	uint32_t       count;
 	uint32_t       interval_usec;
 	uint32_t       payload_len;
+	uint32_t       ttl;
 	uint32_t       reply_timeout_ms;
 	bool           busy;
 	bool           force_copy;
@@ -124,6 +126,7 @@ static void usage(const char *prog)
 		"  --count N                Packets per destination, default: 4\n"
 		"  --interval-usec N        Delay between packets (µs), default: 1000000\n"
 		"  --payload-len N          ICMP payload bytes, default: 32\n"
+		"  --ttl N                  IP TTL, default: 64\n"
 		"  --reply-timeout-ms N     Wait after last send (ms), default: 3000\n"
 		"  --bpf-obj PATH           eBPF object file, default: %s\n"
 		"  --copy                   Force XDP copy mode\n"
@@ -186,6 +189,7 @@ static void parse_args(int argc, char **argv, struct app_config *cfg)
 	cfg->count             = 4;
 	cfg->interval_usec     = DEFAULT_INTERVAL_USEC;
 	cfg->payload_len       = DEFAULT_PAYLOAD_LEN;
+	cfg->ttl               = DEFAULT_TTL;
 	cfg->reply_timeout_ms  = DEFAULT_REPLY_TIMEOUT_MS;
 	cfg->bpf_obj           = DEFAULT_BPF_OBJ;
 
@@ -200,6 +204,8 @@ static void parse_args(int argc, char **argv, struct app_config *cfg)
 			cfg->interval_usec = (uint32_t)parse_ulong(argv[++i], "interval-usec");
 		} else if (!strcmp(argv[i], "--payload-len") && i + 1 < argc) {
 			cfg->payload_len = (uint32_t)parse_ulong(argv[++i], "payload-len");
+		} else if (!strcmp(argv[i], "--ttl") && i + 1 < argc) {
+			cfg->ttl = (uint32_t)parse_ulong(argv[++i], "ttl");
 		} else if (!strcmp(argv[i], "--reply-timeout-ms") && i + 1 < argc) {
 			cfg->reply_timeout_ms = (uint32_t)parse_ulong(argv[++i], "reply-timeout-ms");
 		} else if (!strcmp(argv[i], "--bpf-obj") && i + 1 < argc) {
@@ -248,7 +254,7 @@ static void parse_args(int argc, char **argv, struct app_config *cfg)
 	}
 
 	if (!cfg->ifname || cfg->have_dst_ip == cfg->have_dst_subnet ||
-	    !cfg->have_dst_mac || cfg->payload_len > 1400 ||
+	    !cfg->have_dst_mac || cfg->payload_len > 1400 || cfg->ttl > 255 ||
 	    (cfg->force_copy && cfg->force_zerocopy)) {
 		usage(argv[0]); exit(2);
 	}
@@ -311,7 +317,7 @@ static size_t build_icmp_frame(uint8_t *buf, const struct app_config *cfg, uint1
 	memset(ip, 0, sizeof(*ip));
 	ip->version  = 4;
 	ip->ihl      = 5;
-	ip->ttl      = 64;
+	ip->ttl      = (uint8_t)cfg->ttl;
 	ip->protocol = IPPROTO_ICMP;
 	ip->tot_len  = htons((uint16_t)(sizeof(*ip) + sizeof(*icmp) + cfg->payload_len));
 	ip->id       = htons(seq);

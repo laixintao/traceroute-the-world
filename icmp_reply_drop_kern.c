@@ -29,6 +29,13 @@ struct {
 	__uint(max_entries, 1 << 22); /* 4 MiB — if full, events are dropped */
 } icmp_reply_events SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, __u64);
+	__uint(max_entries, 1);
+} ringbuf_drops SEC(".maps");
+
 SEC("xdp")
 int xdp_drop_icmp_reply(struct xdp_md *ctx)
 {
@@ -68,8 +75,12 @@ int xdp_drop_icmp_reply(struct xdp_md *ctx)
 	if (e) {
 		e->src_ip = ip->saddr;
 		bpf_ringbuf_submit(e, 0);
+	} else {
+		__u32 k = 0;
+		__u64 *cnt = bpf_map_lookup_elem(&ringbuf_drops, &k);
+		if (cnt)
+			__sync_fetch_and_add(cnt, 1);
 	}
-	/* if e == NULL the ring is full; event is dropped, packet still dropped */
 
 	return XDP_DROP;
 }

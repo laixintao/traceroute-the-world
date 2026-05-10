@@ -42,7 +42,6 @@
 #define DEFAULT_TTL             64U
 #define DEFAULT_BPF_OBJ         "icmp_reply_drop_kern.o"
 #define DEFAULT_OUTPUT          "replies.bin"
-#define MAX_SEEN_IPS            65536
 
 extern unsigned int if_nametoindex(const char *ifname);
 
@@ -102,10 +101,9 @@ static volatile int      g_running  = 1;
 static struct bpf_object *g_bpf_obj  = NULL;
 static int               g_ifindex   = 0;
 
-/* ── seen-IP tracking (only written by reader thread) ────────────────────── */
+/* ── reply counter (only written by reader thread) ───────────────────────── */
 
-static uint32_t g_seen_ips[MAX_SEEN_IPS];
-static int      g_seen_count = 0;
+static uint64_t g_reply_count = 0;
 
 /* ── signal handler ──────────────────────────────────────────────────────── */
 
@@ -543,37 +541,54 @@ struct icmp_event {
 	uint32_t src_ip; /* network byte order */
 };
 
-static bool already_seen(uint32_t ip)
-{
-	for (int i = 0; i < g_seen_count; i++)
-		if (g_seen_ips[i] == ip) return true;
-	return false;
-}
+struct reader_args {
+	struct ring_buffer *rb;
+	int drop_map_fd;
+};
 
 static int handle_event(void *ctx, void *data, size_t data_sz)
 {
 	(void)ctx; (void)data_sz;
 	const struct icmp_event *e = data;
-	uint32_t key = e->src_ip; /* network byte order */
+	uint32_t ip_host = ntohl(e->src_ip);
 
-	if (!already_seen(key)) {
-		ipdb_mark(ntohl(key));
-		char ip_str[INET_ADDRSTRLEN];
-		inet_ntop(AF_INET, &key, ip_str, sizeof(ip_str));
-		putchar('.');
-		fflush(stdout);
-		if (g_seen_count < MAX_SEEN_IPS)
-			g_seen_ips[g_seen_count++] = key;
+	if (!ipdb_check(ip_host)) {
+		ipdb_mark(ip_host);
+		g_reply_count++;
+		if (g_reply_count % 100 == 0) {
+			putchar('.');
+			fflush(stdout);
+		}
 	}
 	return 0;
 }
 
 static void *reader_thread_fn(void *arg)
 {
-	struct ring_buffer *rb = arg;
+	struct reader_args *rargs = arg;
+	struct ring_buffer *rb    = rargs->rb;
+	int drop_fd               = rargs->drop_map_fd;
+	uint64_t last_drops       = 0;
+	int poll_count            = 0;
 
-	while (g_running)
+	while (g_running) {
 		ring_buffer__poll(rb, 100 /* ms */);
+
+		/* check drop counter ~every second (10 × 100 ms) */
+		if (drop_fd >= 0 && ++poll_count >= 10) {
+			poll_count = 0;
+			uint32_t key  = 0;
+			uint64_t drops = 0;
+			if (bpf_map_lookup_elem(drop_fd, &key, &drops) == 0 &&
+			    drops > last_drops) {
+				fprintf(stderr,
+					"\n[warning] ring buffer overflowed, "
+					"%llu event(s) dropped so far\n",
+					(unsigned long long)drops);
+				last_drops = drops;
+			}
+		}
+	}
 
 	/* final drain */
 	ring_buffer__poll(rb, 0);
@@ -636,9 +651,12 @@ int main(int argc, char **argv)
 	signal(SIGTERM, sig_handler);
 
 	/* ② Start reader thread — consumes ring buffer events */
+	int drop_map_fd = bpf_object__find_map_fd_by_name(g_bpf_obj, "ringbuf_drops");
+	struct reader_args rargs = { .rb = rb, .drop_map_fd = drop_map_fd };
+
 	pthread_t reader_tid;
 	bool      reader_started = false;
-	if (pthread_create(&reader_tid, NULL, reader_thread_fn, rb) != 0) {
+	if (pthread_create(&reader_tid, NULL, reader_thread_fn, &rargs) != 0) {
 		perror("pthread_create");
 		ring_buffer__free(rb);
 		xdp_unload();
@@ -744,7 +762,7 @@ int main(int argc, char **argv)
 	if (reader_started)
 		pthread_join(reader_tid, NULL);
 
-	fprintf(stderr, "%d unique IP(s) replied.\n", g_seen_count);
+	fprintf(stderr, "\n%llu unique IP(s) replied.\n", (unsigned long long)g_reply_count);
 
 cleanup:
 	if (rb)

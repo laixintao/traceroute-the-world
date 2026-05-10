@@ -58,8 +58,10 @@ int xdp_drop_icmp_reply(struct xdp_md *ctx)
 	if ((void *)(icmp + 1) > data_end)
 		return XDP_PASS;
 
+	/* Drop all ICMP that isn't an Echo Reply (unreachable, time-exceeded…)
+	 * so the kernel never processes them and they don't pollute the stack. */
 	if (icmp->type != ICMP_ECHOREPLY)
-		return XDP_PASS;
+		return XDP_DROP;
 
 	struct icmp_event *e = bpf_ringbuf_reserve(&icmp_reply_events,
 						    sizeof(*e), 0);

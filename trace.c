@@ -687,6 +687,17 @@ int main(int argc, char **argv)
 
 	/* ④ Send packets via AF_XDP */
 	for (uint32_t dst_ip = cfg.dst_start; g_running && send_ok; dst_ip++) {
+		uint64_t offset = (uint64_t)(dst_ip - cfg.dst_start);
+		if (offset > 0 && offset % (256 * 256) == 0) {
+			char cur[INET_ADDRSTRLEN];
+			struct in_addr cur_a = {.s_addr = htonl(dst_ip)};
+			inet_ntop(AF_INET, &cur_a, cur, sizeof(cur));
+			fprintf(stderr, "[progress] %-20s  %llu / %llu IPs\n",
+				cur,
+				(unsigned long long)offset,
+				(unsigned long long)dst_count);
+		}
+
 		if (ipdb_ignore_check(dst_ip)) {
 			if (dst_ip == cfg.dst_end) break;
 			continue;

@@ -31,8 +31,6 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-
 	uint8_t *buf = malloc(CHUNK_SIZE);
 	if (!buf) {
 		perror("malloc");
@@ -41,21 +39,38 @@ int main(int argc, char **argv)
 	}
 
 	uint64_t count = 0;
-	ssize_t  n;
+	off_t    data  = 0;
 
-	while ((n = read(fd, buf, CHUNK_SIZE)) > 0) {
-		for (ssize_t i = 0; i < n; i++)
-			count += buf[i];   /* byte is 0 or 1 */
+	/* SEEK_DATA / SEEK_HOLE skips holes entirely — only allocated pages
+	 * (those touched by ipdb_mark) are read, making this O(replies) not
+	 * O(4 GiB). */
+	while ((data = lseek(fd, data, SEEK_DATA)) >= 0) {
+		off_t hole = lseek(fd, data, SEEK_HOLE);
+		if (hole < 0)
+			hole = (off_t)IPDB_SIZE;
+
+		off_t pos = data;
+		while (pos < hole) {
+			size_t  want = CHUNK_SIZE;
+			off_t   left = hole - pos;
+			if ((off_t)want > left)
+				want = (size_t)left;
+
+			ssize_t n = pread(fd, buf, want, pos);
+			if (n <= 0) {
+				if (n < 0) perror("pread");
+				goto done;
+			}
+			for (ssize_t i = 0; i < n; i++)
+				count += buf[i];
+			pos += n;
+		}
+		data = hole;
 	}
 
+done:
 	free(buf);
 	close(fd);
-
-	if (n < 0) {
-		perror("read");
-		return 1;
-	}
-
 	printf("%llu\n", (unsigned long long)count);
 	return 0;
 }

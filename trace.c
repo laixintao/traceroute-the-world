@@ -2,6 +2,8 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <linux/if_ether.h>
 #include <linux/if.h>
 #include <linux/if_link.h>
@@ -73,6 +75,7 @@ struct app_config {
 	const char    *bpf_obj;
 	const char    *output;
 	const char    *ignore_from;
+	const char    *only_from;
 	uint32_t       queue_id;
 	uint32_t       count;
 	uint32_t       interval_usec;
@@ -136,6 +139,7 @@ static void usage(const char *prog)
 		"  --output PATH            reply bitmap file, default: %s\n"
 		"  --ignore-binary-from PATH  seed output from this file; IPs already\n"
 		"                             set to 1 are skipped and preserved\n"
+		"  --only-binary-from PATH   only ping IPs that are set to 1 in this file\n"
 		"  --bpf-obj PATH           eBPF object file, default: %s\n"
 		"  --copy                   Force XDP copy mode\n"
 		"  --zerocopy               Force XDP zero-copy mode\n"
@@ -225,6 +229,8 @@ static void parse_args(int argc, char **argv, struct app_config *cfg)
 			cfg->output = argv[++i];
 		} else if (!strcmp(argv[i], "--ignore-binary-from") && i + 1 < argc) {
 			cfg->ignore_from = argv[++i];
+		} else if (!strcmp(argv[i], "--only-binary-from") && i + 1 < argc) {
+			cfg->only_from = argv[++i];
 		} else if (!strcmp(argv[i], "--bpf-obj") && i + 1 < argc) {
 			cfg->bpf_obj = argv[++i];
 		} else if (!strcmp(argv[i], "--src-ip") && i + 1 < argc) {
@@ -637,6 +643,34 @@ int main(int argc, char **argv)
 		fprintf(stderr, "seeded from:  %s\n", cfg.ignore_from);
 	}
 
+	/* Open only_from file as a read-only allowlist */
+	uint8_t *only_map = NULL;
+	int      only_fd  = -1;
+	if (cfg.only_from) {
+		only_fd = open(cfg.only_from, O_RDONLY);
+		if (only_fd < 0) {
+			perror(cfg.only_from);
+			ipdb_close();
+			return 1;
+		}
+		struct stat only_st;
+		if (fstat(only_fd, &only_st) < 0 ||
+		    (uint64_t)only_st.st_size != ((uint64_t)1 << 32)) {
+			fprintf(stderr, "%s: not a valid 4 GiB ipdb file\n", cfg.only_from);
+			close(only_fd);
+			ipdb_close();
+			return 1;
+		}
+		only_map = mmap(NULL, (size_t)1 << 32, PROT_READ, MAP_SHARED, only_fd, 0);
+		if (only_map == MAP_FAILED) {
+			perror("mmap only_from");
+			close(only_fd);
+			ipdb_close();
+			return 1;
+		}
+		fprintf(stderr, "only from:    %s\n", cfg.only_from);
+	}
+
 	/* ② Load XDP program — intercepts and drops incoming ICMP replies */
 	struct ring_buffer *rb = NULL;
 	int map_fd;
@@ -730,6 +764,11 @@ int main(int argc, char **argv)
 					(unsigned long long)dst_count);
 			}
 
+			if (only_map && !only_map[dst_ip]) {
+				if (dst_ip == cfg.dst_end) break;
+				continue;
+			}
+
 			if (ipdb_check(dst_ip)) {
 				if (dst_ip == cfg.dst_end) break;
 				continue;
@@ -779,6 +818,8 @@ int main(int argc, char **argv)
 	fprintf(stderr, "\n%llu unique IP(s) replied.\n", (unsigned long long)g_reply_count);
 
 cleanup:
+	if (only_map) munmap(only_map, (size_t)1 << 32);
+	if (only_fd >= 0) close(only_fd);
 	if (rb)
 		ring_buffer__free(rb);
 	ipdb_close();

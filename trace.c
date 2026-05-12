@@ -83,6 +83,7 @@ struct app_config {
 	uint32_t       ttl;
 	uint32_t       reply_timeout_ms;
 	uint32_t       rounds;
+	uint32_t       pps;       /* packets per second, 0 = use interval_usec */
 	bool           busy;
 	bool           force_copy;
 	bool           force_zerocopy;
@@ -130,7 +131,8 @@ static void usage(const char *prog)
 		"  --src-mac xx:..:xx       Source MAC, default: interface MAC\n"
 		"  --queue N                TX queue id, default: 0\n"
 		"  --count N                Packets per destination, default: 4\n"
-		"  --interval-usec N        Delay between packets (µs), default: 1000000\n"
+		"  --pps N                  Send rate in packets/sec (accurate, clock-based)\n"
+		"  --interval-usec N        Delay between packets (µs); ignored if --pps set\n"
 		"  --payload-len N          ICMP payload bytes, default: 32\n"
 		"  --ttl N                  IP TTL, default: 64\n"
 		"  --reply-timeout-ms N     Wait after last send (ms), default: 3000\n"
@@ -214,6 +216,9 @@ static void parse_args(int argc, char **argv, struct app_config *cfg)
 			cfg->queue_id = (uint32_t)parse_ulong(argv[++i], "queue");
 		} else if (!strcmp(argv[i], "--count") && i + 1 < argc) {
 			cfg->count = (uint32_t)parse_ulong(argv[++i], "count");
+		} else if (!strcmp(argv[i], "--pps") && i + 1 < argc) {
+			cfg->pps = (uint32_t)parse_ulong(argv[++i], "pps");
+			if (cfg->pps == 0) { fprintf(stderr, "--pps must be > 0\n"); exit(2); }
 		} else if (!strcmp(argv[i], "--interval-usec") && i + 1 < argc) {
 			cfg->interval_usec = (uint32_t)parse_ulong(argv[++i], "interval-usec");
 		} else if (!strcmp(argv[i], "--payload-len") && i + 1 < argc) {
@@ -495,6 +500,58 @@ static int send_one(struct xsk_socket *xsk, const struct app_config *cfg,
 	return 0;
 }
 
+/* ── PPS rate limiter ────────────────────────────────────────────────────── */
+
+struct pps_limiter {
+	uint64_t       ns_per_pkt;
+	struct timespec next;
+};
+
+static int64_t timespec_ns(const struct timespec *ts)
+{
+	return (int64_t)ts->tv_sec * 1000000000LL + ts->tv_nsec;
+}
+
+static struct timespec ns_to_timespec(int64_t ns)
+{
+	return (struct timespec){
+		.tv_sec  = ns / 1000000000LL,
+		.tv_nsec = ns % 1000000000LL,
+	};
+}
+
+static void pps_limiter_init(struct pps_limiter *lim, uint32_t pps)
+{
+	lim->ns_per_pkt = pps ? 1000000000ULL / pps : 0;
+	clock_gettime(CLOCK_MONOTONIC, &lim->next);
+}
+
+static void pps_limiter_wait(struct pps_limiter *lim)
+{
+	if (!lim->ns_per_pkt) return;
+
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	int64_t now_ns  = timespec_ns(&now);
+	int64_t next_ns = timespec_ns(&lim->next);
+
+	if (now_ns < next_ns) {
+		struct timespec delay = ns_to_timespec(next_ns - now_ns);
+		nanosleep(&delay, NULL);
+	}
+
+	next_ns += (int64_t)lim->ns_per_pkt;
+
+	/* If we're falling more than 100 ms behind (e.g. system was busy),
+	 * reset the clock instead of sending a catch-up burst. */
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	now_ns = timespec_ns(&now);
+	if (next_ns < now_ns - 100000000LL)
+		next_ns = now_ns;
+
+	lim->next = ns_to_timespec(next_ns);
+}
+
 /* ── XDP program load / unload ───────────────────────────────────────────── */
 
 static int xdp_load(const char *obj_path, int ifindex, int *map_fd_out)
@@ -735,10 +792,19 @@ int main(int argc, char **argv)
 		cfg.ifname, cfg.queue_id, src);
 	if (cfg.rounds > 1)
 		fprintf(stderr, "rounds: %u\n", cfg.rounds);
+	if (cfg.pps)
+		fprintf(stderr, "rate  : %u pps\n", cfg.pps);
+	else if (cfg.busy)
+		fprintf(stderr, "rate  : unlimited (busy)\n");
+	else if (cfg.interval_usec)
+		fprintf(stderr, "rate  : ~%u pps (interval %u µs)\n",
+			1000000 / cfg.interval_usec, cfg.interval_usec);
 	fprintf(stderr, "starting in 2s, Ctrl-C to cancel...\n");
 
 	uint64_t frame_idx = 0;
 	bool     send_ok   = true;
+	struct pps_limiter limiter;
+	pps_limiter_init(&limiter, cfg.pps);
 
 	sleep(2);
 	if (!g_running)
@@ -787,7 +853,9 @@ int main(int argc, char **argv)
 				}
 				frame_idx++;
 				reap_completions(&xsk);
-				if (!cfg.busy && cfg.interval_usec)
+				if (cfg.pps)
+					pps_limiter_wait(&limiter);
+				else if (!cfg.busy && cfg.interval_usec)
 					usleep(cfg.interval_usec);
 			}
 			if (dst_ip == cfg.dst_end) break;

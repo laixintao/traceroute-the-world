@@ -21,6 +21,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <time.h>
@@ -39,6 +40,7 @@
 #define TX_FRAME_BASE           RING_SIZE
 #define TX_NUM_FRAMES           (NUM_FRAMES - TX_FRAME_BASE)
 #define DEFAULT_PAYLOAD_LEN     32U
+#define MIN_PAYLOAD_LEN         4U
 #define DEFAULT_INTERVAL_USEC   1000000U
 #define DEFAULT_REPLY_TIMEOUT_MS 3000U
 #define DEFAULT_TTL             64U
@@ -102,6 +104,7 @@ struct app_config {
 
 /* ── global state shared between main and signal handler ─────────────────── */
 
+static uint32_t          g_secret   = 0;
 static volatile int      g_running  = 1;
 static struct bpf_object *g_bpf_obj  = NULL;
 static int               g_ifindex   = 0;
@@ -282,7 +285,8 @@ static void parse_args(int argc, char **argv, struct app_config *cfg)
 	}
 
 	if (!cfg->ifname || cfg->have_dst_ip == cfg->have_dst_subnet ||
-	    !cfg->have_dst_mac || cfg->payload_len > 1400 || cfg->ttl > 255 ||
+	    !cfg->have_dst_mac || cfg->payload_len < MIN_PAYLOAD_LEN ||
+	    cfg->payload_len > 1400 || cfg->ttl > 255 ||
 	    (cfg->force_copy && cfg->force_zerocopy)) {
 		usage(argv[0]); exit(2);
 	}
@@ -357,7 +361,9 @@ static size_t build_icmp_frame(uint8_t *buf, const struct app_config *cfg, uint1
 	icmp->type             = ICMP_ECHO;
 	icmp->un.echo.id       = htons((uint16_t)getpid());
 	icmp->un.echo.sequence = htons(seq);
-	for (uint32_t i = 0; i < cfg->payload_len; i++)
+	uint32_t cookie = htonl(g_secret ^ ntohl(cfg->dst_ip.s_addr));
+	memcpy(payload, &cookie, 4);
+	for (uint32_t i = 4; i < cfg->payload_len; i++)
 		payload[i] = (uint8_t)i;
 	icmp->checksum = checksum(icmp, sizeof(*icmp) + cfg->payload_len);
 
@@ -686,6 +692,10 @@ int main(int argc, char **argv)
 		perror("get interface IPv4"); return 1;
 	}
 
+	if (getrandom(&g_secret, sizeof(g_secret), 0) != sizeof(g_secret)) {
+		perror("getrandom"); return 1;
+	}
+
 	/* ① Open reply bitmap (create if needed) */
 	if (ipdb_open(cfg.output) != 0)
 		return 1;
@@ -736,6 +746,24 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	fprintf(stderr, "XDP program loaded (%s)\n", cfg.bpf_obj);
+
+	/* Push secret into BPF map so XDP program can verify reply cookies */
+	int secret_map_fd = bpf_object__find_map_fd_by_name(g_bpf_obj, "icmp_secret");
+	if (secret_map_fd < 0) {
+		fprintf(stderr, "BPF map 'icmp_secret' not found\n");
+		ipdb_close();
+		xdp_unload();
+		return 1;
+	}
+	{
+		uint32_t key = 0;
+		if (bpf_map_update_elem(secret_map_fd, &key, &g_secret, BPF_ANY) != 0) {
+			perror("bpf_map_update_elem(icmp_secret)");
+			ipdb_close();
+			xdp_unload();
+			return 1;
+		}
+	}
 
 	rb = ring_buffer__new(map_fd, handle_event, NULL, NULL);
 	if (!rb) {

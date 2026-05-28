@@ -24,6 +24,17 @@ struct icmp_event {
 	__u32 src_ip; /* IPv4 source address, network byte order */
 };
 
+/*
+ * Written by user-space after XDP load: g_secret used when encoding
+ * cookie = g_secret ^ dst_ip_host in ICMP payload[0..3].
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, __u32);
+	__uint(max_entries, 1);
+} icmp_secret SEC(".maps");
+
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 1 << 22); /* 4 MiB — if full, events are dropped */
@@ -68,6 +79,22 @@ int xdp_drop_icmp_reply(struct xdp_md *ctx)
 	/* Drop all ICMP that isn't an Echo Reply (unreachable, time-exceeded…)
 	 * so the kernel never processes them and they don't pollute the stack. */
 	if (icmp->type != ICMP_ECHOREPLY)
+		return XDP_DROP;
+
+	/* Verify cookie: payload[0..3] (big-endian) must equal secret ^ src_ip_host.
+	 * Replies without a valid cookie are dropped silently — not our packets. */
+	__u8 *payload = (__u8 *)(icmp + 1);
+	if ((void *)(payload + 4) > data_end)
+		return XDP_DROP;
+
+	__u32 map_key = 0;
+	__u32 *secret = bpf_map_lookup_elem(&icmp_secret, &map_key);
+	if (!secret)
+		return XDP_DROP;
+
+	__u32 got_be;
+	__builtin_memcpy(&got_be, payload, sizeof(got_be));
+	if (bpf_ntohl(got_be) != (*secret ^ bpf_ntohl(ip->saddr)))
 		return XDP_DROP;
 
 	struct icmp_event *e = bpf_ringbuf_reserve(&icmp_reply_events,

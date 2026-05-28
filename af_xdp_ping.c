@@ -18,6 +18,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/random.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -33,8 +34,12 @@
 #define TX_NUM_FRAMES (NUM_FRAMES - TX_FRAME_BASE)
 #define DEFAULT_PAYLOAD_LEN 32U
 #define DEFAULT_INTERVAL_USEC 1000000U
+#define DEFAULT_WAIT_MS 3000U
+#define MIN_PAYLOAD_LEN 4U
 
 extern unsigned int if_nametoindex(const char *ifname);
+
+static uint32_t g_secret;
 
 struct xsk_ring {
 	uint32_t *producer;
@@ -51,6 +56,7 @@ struct app_config {
 	uint32_t count;
 	uint32_t interval_usec;
 	uint32_t payload_len;
+	uint32_t wait_ms;
 	bool busy;
 	bool force_copy;
 	bool force_zerocopy;
@@ -92,7 +98,8 @@ static void usage(const char *prog)
 		"  --payload-len N        ICMP payload length, default: 32\n"
 		"  --copy                 Force XDP copy mode\n"
 		"  --zerocopy             Force XDP zero-copy mode\n"
-		"  --busy                 Send without sleeping between packets\n",
+		"  --busy                 Send without sleeping between packets\n"
+		"  --wait-ms N            After sending, wait N ms for replies (default: 3000)\n",
 		prog);
 }
 
@@ -155,6 +162,7 @@ static void parse_args(int argc, char **argv, struct app_config *cfg)
 	cfg->count = 4;
 	cfg->interval_usec = DEFAULT_INTERVAL_USEC;
 	cfg->payload_len = DEFAULT_PAYLOAD_LEN;
+	cfg->wait_ms = DEFAULT_WAIT_MS;
 
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--dev") && i + 1 < argc) {
@@ -197,6 +205,8 @@ static void parse_args(int argc, char **argv, struct app_config *cfg)
 				exit(2);
 			}
 			cfg->have_dst_mac = true;
+		} else if (!strcmp(argv[i], "--wait-ms") && i + 1 < argc) {
+			cfg->wait_ms = (uint32_t)parse_ulong(argv[++i], "wait-ms");
 		} else if (!strcmp(argv[i], "--copy")) {
 			cfg->force_copy = true;
 		} else if (!strcmp(argv[i], "--zerocopy")) {
@@ -218,7 +228,8 @@ static void parse_args(int argc, char **argv, struct app_config *cfg)
 	}
 
 	if (!cfg->ifname || cfg->have_dst_ip == cfg->have_dst_subnet || !cfg->have_dst_mac ||
-	    cfg->payload_len > 1400 || (cfg->force_copy && cfg->force_zerocopy)) {
+	    cfg->payload_len < MIN_PAYLOAD_LEN || cfg->payload_len > 1400 ||
+	    (cfg->force_copy && cfg->force_zerocopy)) {
 		usage(argv[0]);
 		exit(2);
 	}
@@ -304,7 +315,10 @@ static size_t build_icmp_frame(uint8_t *buf, const struct app_config *cfg, uint1
 	icmp->type = ICMP_ECHO;
 	icmp->un.echo.id = htons((uint16_t)getpid());
 	icmp->un.echo.sequence = htons(seq);
-	for (uint32_t i = 0; i < cfg->payload_len; i++)
+	/* cookie = g_secret ^ dst_ip; target echoes payload back, receiver verifies */
+	uint32_t cookie = htonl(g_secret ^ ntohl(cfg->dst_ip.s_addr));
+	memcpy(payload, &cookie, 4);
+	for (uint32_t i = 4; i < cfg->payload_len; i++)
 		payload[i] = (uint8_t)i;
 	icmp->checksum = checksum(icmp, sizeof(*icmp) + cfg->payload_len);
 
@@ -458,6 +472,65 @@ static int send_one(struct xsk_socket *xsk, const struct app_config *cfg, uint32
 	return 0;
 }
 
+static bool verify_icmp_reply(const uint8_t *pkt, uint32_t len)
+{
+	if (len < sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct icmphdr) + 4)
+		return false;
+	const struct iphdr *ip = (const struct iphdr *)(pkt + sizeof(struct ethhdr));
+	if (ip->version != 4 || ip->protocol != IPPROTO_ICMP)
+		return false;
+	size_t ip_sz = ip->ihl * 4u;
+	if (len < sizeof(struct ethhdr) + ip_sz + sizeof(struct icmphdr) + 4)
+		return false;
+	const struct icmphdr *icmp = (const struct icmphdr *)(pkt + sizeof(struct ethhdr) + ip_sz);
+	if (icmp->type != ICMP_ECHOREPLY)
+		return false;
+	const uint8_t *payload = (const uint8_t *)(icmp + 1);
+	uint32_t got;
+	memcpy(&got, payload, 4);
+	/* src_ip of the reply equals the dst_ip we originally targeted */
+	return ntohl(got) == (g_secret ^ ntohl(ip->saddr));
+}
+
+static void drain_rx(struct xsk_socket *xsk, uint64_t *valid_out)
+{
+	uint32_t prod = __atomic_load_n(xsk->rx.producer, __ATOMIC_ACQUIRE);
+	uint32_t cons = *xsk->rx.consumer;
+	uint32_t n = prod - cons;
+	if (!n)
+		return;
+
+	struct xdp_desc *rxd = (struct xdp_desc *)xsk->rx.desc;
+
+	for (uint32_t i = 0; i < n; i++) {
+		uint32_t idx = (cons + i) & xsk->rx.mask;
+		const uint8_t *pkt = (const uint8_t *)xsk->umem + rxd[idx].addr;
+		uint32_t len = rxd[idx].len;
+
+		if (!verify_icmp_reply(pkt, len))
+			continue;
+
+		(*valid_out)++;
+		const struct iphdr *ip = (const struct iphdr *)(pkt + sizeof(struct ethhdr));
+		const struct icmphdr *icmp =
+			(const struct icmphdr *)(pkt + sizeof(struct ethhdr) + ip->ihl * 4u);
+		char src[INET_ADDRSTRLEN];
+		struct in_addr saddr = {.s_addr = ip->saddr};
+		inet_ntop(AF_INET, &saddr, src, sizeof(src));
+		printf("reply from %-16s seq=%u\n", src, ntohs(icmp->un.echo.sequence));
+	}
+
+	/* recycle frames back to fill queue before releasing rx */
+	uint64_t *fq = (uint64_t *)xsk->fq.desc;
+	uint32_t fq_prod = *xsk->fq.producer;
+	for (uint32_t i = 0; i < n; i++) {
+		uint32_t idx = (cons + i) & xsk->rx.mask;
+		fq[(fq_prod + i) & xsk->fq.mask] = rxd[idx].addr;
+	}
+	ring_submit(&xsk->fq, n);
+	ring_release(&xsk->rx, n);
+}
+
 int main(int argc, char **argv)
 {
 	struct app_config cfg = {0};
@@ -475,6 +548,11 @@ int main(int argc, char **argv)
 	}
 	if (!cfg.have_src_ip && get_if_ipv4(cfg.ifname, &cfg.src_ip) != 0) {
 		perror("get interface IPv4");
+		return 1;
+	}
+
+	if (getrandom(&g_secret, sizeof(g_secret), 0) != sizeof(g_secret)) {
+		perror("getrandom");
 		return 1;
 	}
 
@@ -511,6 +589,7 @@ int main(int argc, char **argv)
 			}
 			frame_idx++;
 			reap_completions(&xsk);
+			drain_rx(&xsk, &(uint64_t){0});
 			if (!cfg.busy && cfg.interval_usec)
 				usleep(cfg.interval_usec);
 		}
@@ -526,6 +605,28 @@ int main(int argc, char **argv)
 		(void)poll(&pfd, 1, 10);
 	}
 
-	fprintf(stderr, "done\n");
+	fprintf(stderr, "waiting %u ms for replies...\n", cfg.wait_ms);
+	uint64_t valid_replies = 0;
+	struct timespec deadline;
+	clock_gettime(CLOCK_MONOTONIC, &deadline);
+	deadline.tv_sec += cfg.wait_ms / 1000;
+	deadline.tv_nsec += (cfg.wait_ms % 1000) * 1000000L;
+	if (deadline.tv_nsec >= 1000000000L) {
+		deadline.tv_sec++;
+		deadline.tv_nsec -= 1000000000L;
+	}
+	for (;;) {
+		struct timespec now;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if (now.tv_sec > deadline.tv_sec ||
+		    (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
+			break;
+		drain_rx(&xsk, &valid_replies);
+		struct pollfd pfd = {.fd = xsk.fd, .events = POLLIN};
+		(void)poll(&pfd, 1, 50);
+	}
+	drain_rx(&xsk, &valid_replies);
+
+	fprintf(stderr, "done: %llu valid replies\n", (unsigned long long)valid_replies);
 	return 0;
 }
